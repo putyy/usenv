@@ -1,0 +1,19 @@
+[package]
+name = "usenv"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow = "1"
+gpui = { version = "=0.2.2", default-features = false, features = ["font-kit", "runtime_shaders"] }
+libc = "0.2"
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSAttributedString", "NSColor", "NSFont", "NSMenu", "NSMenuItem", "NSResponder", "NSRunningApplication", "NSStringDrawing", "objc2-core-foundation"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["NSAppleEventManager", "NSAppleEventDescriptor", "NSAttributedString", "NSDictionary", "NSObject", "NSRange", "NSString", "NSValue"] }
+objc2-service-management = { version = "0.3", default-features = false, features = ["std", "objc2", "objc2-foundation", "SMAppService"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+tray-icon = { version = "=0.21.2", default-features = false }
+url = "2.5"
