@@ -5619,7 +5619,7 @@ dependencies = [
 
 [[package]]
 name = "usenv"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "gpui",
@@ -5630,6 +5630,7 @@ dependencies = [
  "objc2-service-management",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "tray-icon",
  "url",

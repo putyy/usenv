@@ -451,6 +451,9 @@ impl Snapshot {
     }
 
     pub fn action_available(&self, action: &Action) -> bool {
+        if matches!(self.update, UpdateStatus::Installing) {
+            return false;
+        }
         if self.brew_detection_failed
             && matches!(action.install_scope().or_else(|| action.foreground_scope(self)),
                 Some(InstallScope::Brew | InstallScope::NpmBrew))
@@ -463,7 +466,7 @@ impl Snapshot {
             return false;
         }
         if matches!(action, Action::CheckUpdate) {
-            return !matches!(self.update, UpdateStatus::Checking);
+            return !matches!(self.update, UpdateStatus::Checking) && self.update.progress().is_none();
         }
         if matches!(action, Action::ReadCurrentJava) {
             return !matches!(self.current_java, CurrentJavaStatus::Checking(_));
@@ -720,6 +723,47 @@ impl Controller {
         state.generation += 1;
     }
 
+    /// Called on the background executor. A successful launch lets the UI quit the old process.
+    pub fn install_update(&self, version: &str) -> bool {
+        let (release, address) = {
+            let mut state = self.state.lock().unwrap();
+            let Some(release) = state.update.offer().filter(|r| r.version == version).cloned() else {
+                return false;
+            };
+            state.update = UpdateStatus::Downloading;
+            state.generation += 1;
+            (release, state.settings.proxy.clone())
+        };
+        let result = updates::prepare(&release, Some(&address)).and_then(|prepared| {
+            loop {
+                let mut state = self.state.lock().unwrap();
+                let pending = state.busy.is_some() || state.output_tasks.iter().any(|task| task.status.active())
+                    || !state.pending_visibility.is_empty() || state.pending_theme.is_some()
+                    || state.pending_parallel_installs.is_some();
+                if !pending {
+                    state.update = UpdateStatus::Installing;
+                    state.generation += 1;
+                    break;
+                }
+                if !matches!(state.update, UpdateStatus::Waiting) {
+                    state.update = UpdateStatus::Waiting;
+                    state.generation += 1;
+                }
+                drop(state);
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            prepared.install()
+        });
+        if let Err(error) = result {
+            let mut state = self.state.lock().unwrap();
+            state.update = UpdateStatus::InstallFailed(release, format!("{error:#}"));
+            state.dismissed_update_version = None;
+            state.generation += 1;
+            return false;
+        }
+        true
+    }
+
     pub fn snapshot_if_changed(&self, generation: u64) -> Option<Snapshot> {
         let state = self.state.lock().unwrap();
         (state.generation != generation).then(|| state.clone())
@@ -732,6 +776,7 @@ impl Controller {
         }
         state.generation += 1;
         if matches!(&action, Action::CheckUpdate) {
+            state.dismissed_update_version = None;
             state.update = UpdateStatus::Checking;
             let address = state.settings.proxy.clone();
             let update_state = self.state.clone();
@@ -860,6 +905,9 @@ impl Controller {
 
     pub fn retry_task(&self, id: u64) {
         let mut state = self.state.lock().unwrap();
+        if matches!(state.update, UpdateStatus::Installing) {
+            return;
+        }
         let Some(index) = state.output_tasks.iter().position(|task| task.id == id) else {
             return;
         };
@@ -888,6 +936,9 @@ impl Controller {
 
     pub fn set_preference(&self, preference: Preference) {
         let mut state = self.state.lock().unwrap();
+        if matches!(state.update, UpdateStatus::Installing) {
+            return;
+        }
         if let Preference::ParallelInstalls(limit) = preference
             && (!(MIN_PARALLEL_INSTALLS..=MAX_PARALLEL_INSTALLS).contains(&limit)
                 || state.parallel_installs() == limit)

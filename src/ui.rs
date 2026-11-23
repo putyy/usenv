@@ -176,11 +176,19 @@ enum Manager {
     Mise,
 }
 
+struct UpdateDialog {
+    previous_focus: Option<FocusHandle>,
+    github: FocusHandle,
+    cancel: FocusHandle,
+    install: FocusHandle,
+}
+
 pub struct Ui {
     controller: Controller,
     snapshot: Snapshot,
     page: Page,
     sidebar_collapsed: bool,
+    update_dialog: Option<UpdateDialog>,
     expanded_services: Option<Environment>,
     open_actions: Option<SharedString>,
     log_open: bool,
@@ -234,6 +242,7 @@ impl Ui {
             controller,
             page: first_page(&snapshot),
             sidebar_collapsed: false,
+            update_dialog: None,
             expanded_services: None,
             open_actions: None,
             log_open: false,
@@ -1085,6 +1094,7 @@ impl Ui {
                     (format!("{} · {label}", task.title), color)
                 })
             });
+        let status = self.snapshot.update.progress().map(|text| (text.to_owned(), colors.accent)).or(status);
         let has_status = status.is_some();
         let has_output = !self.snapshot.output_tasks.is_empty();
         let status_area = div().id("open-output-status").flex_1().min_w_0().h_full()
@@ -3311,7 +3321,6 @@ impl Ui {
             .children(self.manager_setup(None, window, colors, cx))
             .child(self.sidebar_preferences(colors, cx))
             .child(self.shell_preferences(colors, cx))
-            .child(self.update_preferences(colors, cx))
             .child(
                 section("下载", colors.muted).child(
                     panel(colors)
@@ -3416,6 +3425,7 @@ impl Ui {
                         )),
                 ),
             )
+            .child(self.update_preferences(colors, cx))
     }
 
     fn install_parallelism(&self, colors: Palette, cx: &Context<Self>) -> Div {
@@ -3442,41 +3452,141 @@ impl Ui {
             })))
     }
 
-    fn update_notice(&self, colors: Palette, cx: &Context<Self>) -> Option<Div> {
-        let UpdateStatus::Available { version, page, dmg } = &self.snapshot.update else {
-            return None;
-        };
-        if self.snapshot.dismissed_update_version.as_ref() == Some(version) {
-            return None;
+    fn open_update_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.update_dialog.is_some() || self.snapshot.update.offer().is_none() {
+            return;
         }
-        let label = if dmg.is_some() { "下载 DMG" } else { "发布说明" };
-        let url = dmg.as_ref().unwrap_or(page).clone();
-        let version = version.clone();
-        Some(panel(colors).mx_7().mt_3().px_3().py_2().flex().items_center().gap_2()
-            .child(div().flex_1().child(format!("发现新版本 {version}")))
-            .child(button("open-available-update", label, ButtonStyle::Primary, true, colors)
-                .on_click(move |_, _, cx| cx.open_url(&url)))
-            .child(button("dismiss-update", "稍后", ButtonStyle::Plain, true, colors)
-                .on_click(cx.listener(move |view, _, _, cx| {
-                    view.controller.dismiss_update_notice(&version);
-                    view.sync(cx);
-                }))))
+        self.open_actions = None;
+        let dialog = UpdateDialog {
+            previous_focus: window.focused(cx),
+            github: cx.focus_handle(),
+            cancel: cx.focus_handle(),
+            install: cx.focus_handle(),
+        };
+        window.focus(&dialog.cancel);
+        self.update_dialog = Some(dialog);
+        cx.notify();
+    }
+
+    fn dismiss_update_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(release) = self.snapshot.update.offer() {
+            self.controller.dismiss_update_notice(&release.version);
+        }
+        if let Some(previous) = self.update_dialog.take().and_then(|dialog| dialog.previous_focus) {
+            window.focus(&previous);
+        } else {
+            window.blur();
+        }
+        self.sync(cx);
+        cx.notify();
+    }
+
+    fn install_dialog_update(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(release) = self.snapshot.update.offer() else { return };
+        let version = release.version.clone();
+        self.dismiss_update_dialog(window, cx);
+        let controller = self.controller.clone();
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |_, cx| {
+            if executor.spawn(async move { controller.install_update(&version) }).await {
+                let _ = cx.update(|cx| cx.quit());
+            }
+        }).detach();
+    }
+
+    fn render_update_dialog(&self, colors: Palette, cx: &Context<Self>) -> Option<Div> {
+        let dialog = self.update_dialog.as_ref()?;
+        let release = self.snapshot.update.offer()?;
+        let page = release.page.clone();
+        let can_install = release.dmg.is_some();
+        let error = match &self.snapshot.update {
+            UpdateStatus::InstallFailed(_, message) => Some(message.as_str()),
+            _ => None,
+        };
+        let title = if error.is_some() { "Usenv 更新失败" } else { "发现新版本" };
+        let version_block = |label: &'static str, version: &str, background: Rgba, ink: Rgba| {
+            div().flex_1().min_w_0().rounded_md().px_3().py_2().bg(background)
+                .flex().flex_col().gap_1()
+                .child(div().text_size(px(11.)).line_height(px(15.)).text_color(ink).child(label))
+                .child(div().truncate().font_family("Menlo").text_size(px(17.)).line_height(px(22.))
+                    .font_weight(FontWeight::SEMIBOLD).text_color(ink).child(version.to_owned()))
+        };
+        let github = dialog.github.clone();
+        let github_link = div().id("update-dialog-github").track_focus(&github)
+            .cursor_pointer().text_color(colors.accent).text_size(px(12.))
+            .hover(|s| s.underline()).focus(|s| s.underline())
+            .child("在 GitHub 查看 ↗")
+            .on_click(move |_, window, cx| {
+                window.focus(&github);
+                cx.open_url(&page);
+            });
+        let controls = div().flex().items_center().gap_2()
+            .child(button("update-dialog-cancel", "取消", ButtonStyle::Plain, true, colors)
+                .track_focus(&dialog.cancel)
+                .focus(move |style| style.bg(colors.control_hover))
+                .on_click(cx.listener(|view, _, window, cx| view.dismiss_update_dialog(window, cx))))
+            .when(can_install, |row| row.child(
+                button("update-dialog-install", if error.is_some() { "重试更新" } else { "更新" },
+                    ButtonStyle::Primary, true, colors)
+                    .track_focus(&dialog.install)
+                    .on_click(cx.listener(|view, _, window, cx| view.install_dialog_update(window, cx))),
+            ));
+        let card = div().w(px(468.)).max_w_full().max_h_full().flex().flex_col()
+            .rounded_xl().border_1().border_color(colors.control).bg(colors.background).shadow_lg()
+            .child(div().flex_shrink_0().p_5().pb_4().flex().flex_col().gap_3()
+                .child(div().truncate().text_size(px(20.)).line_height(px(26.))
+                    .font_weight(FontWeight::SEMIBOLD).child(title))
+                .child(div().flex().items_center().gap_2()
+                    .child(version_block("当前版本", env!("CARGO_PKG_VERSION"), colors.surface, colors.ink))
+                    .child(div().flex_shrink_0().text_color(colors.muted).child("→"))
+                    .child(version_block("新版本", &release.version, colors.accent_soft, colors.accent))))
+            .child(div().px_5().pb_4().min_h_0().flex().flex_col().gap_2()
+                .child(div().font_weight(FontWeight::SEMIBOLD)
+                    .child(if error.is_some() { "失败原因" } else { "更新内容" }))
+                .child(div().id("update-dialog-notes").min_h_0().max_h(px(200.))
+                    .overflow_y_scroll().child(div().text_color(if error.is_some() { colors.danger } else { colors.ink })
+                        .child(error.unwrap_or(&release.notes).trim().to_owned()))))
+            .child(div().flex_shrink_0().px_5().pb_4().text_size(px(12.)).text_color(colors.muted)
+                .child(if can_install { "下载完成后，Usenv 会自动安装并重新启动。" }
+                    else { "此版本暂未提供适用于本机且可校验的安装包。" }))
+            .child(div().flex_shrink_0().px_5().py_3().border_t_1().border_color(colors.control)
+                .flex().items_center().justify_between().child(github_link).child(controls));
+        Some(div().absolute().inset_0().occlude().p_6().flex().items_center().justify_center()
+            .bg(gpui::rgba(0x10182860))
+            .capture_any_mouse_down(|_, window, _| window.prevent_default())
+            .on_key_down(cx.listener(move |view, event: &KeyDownEvent, window, cx| {
+                match event.keystroke.key.as_str() {
+                    "escape" => view.dismiss_update_dialog(window, cx),
+                    "tab" => {
+                        let Some(dialog) = &view.update_dialog else { return };
+                        let buttons = [&dialog.github, &dialog.cancel, &dialog.install];
+                        let buttons = &buttons[..if can_install { 3 } else { 2 }];
+                        let current = buttons.iter().position(|button| button.is_focused(window)).unwrap_or(1);
+                        let step = if event.keystroke.modifiers.shift { buttons.len() - 1 } else { 1 };
+                        window.focus(buttons[(current + step) % buttons.len()]);
+                    }
+                    _ => return,
+                }
+                cx.stop_propagation();
+            }))
+            .child(card))
     }
 
     fn update_preferences(&self, colors: Palette, cx: &Context<Self>) -> Div {
         let current = env!("CARGO_PKG_VERSION");
-        let message = match &self.snapshot.update {
-            UpdateStatus::Idle => format!("当前版本 {current}"),
-            UpdateStatus::Checking => format!("当前版本 {current} · 正在检查…"),
-            UpdateStatus::NoRelease => format!("当前版本 {current} · GitHub 暂无正式发布"),
-            UpdateStatus::Current => format!("当前版本 {current} · 已是最新版本"),
-            UpdateStatus::Available { version, .. } => format!("当前版本 {current} · 可更新到 {version}"),
-            UpdateStatus::Failed(_) => format!("当前版本 {current} · 更新检查失败"),
+        let status = match &self.snapshot.update {
+            UpdateStatus::Idle => None,
+            UpdateStatus::Checking => Some("正在检查…".into()),
+            UpdateStatus::NoRelease => Some("GitHub 暂无正式发布".into()),
+            UpdateStatus::Current => Some("已是最新版本".into()),
+            UpdateStatus::Available(release) => Some(format!("可更新到 {}", release.version)),
+            UpdateStatus::Failed(_) => Some("更新检查失败".into()),
+            UpdateStatus::InstallFailed(_, _) => Some("更新失败".into()),
+            running => running.progress().map(str::to_owned),
         };
-        let (page, dmg) = match &self.snapshot.update {
-            UpdateStatus::Available { page, dmg, .. } => (page.clone(), dmg.clone()),
-            _ => (updates::RELEASES.into(), None),
-        };
+        let message = status.map_or_else(|| format!("当前版本 {current}"), |status| format!("当前版本 {current} · {status}"));
+        let page = self.snapshot.update.offer().map(|release| release.page.clone())
+            .unwrap_or_else(|| updates::RELEASES.into());
         section("版本更新", colors.muted).child(
             panel(colors).p_4().flex().flex_col().gap_2()
                 .child(div().flex().items_center().gap_2()
@@ -3487,14 +3597,13 @@ impl Ui {
                     ))
                     .child(button("github-releases", "发布说明", ButtonStyle::Plain, true, colors)
                         .on_click(move |_, _, cx| cx.open_url(&page)))
-                    .children(dmg.map(|url| {
-                        button("download-update", "下载 DMG", ButtonStyle::Primary, true, colors)
-                            .on_click(move |_, _, cx| cx.open_url(&url))
+                    .children(self.snapshot.update.offer().map(|_| {
+                        button("show-update", "查看更新", ButtonStyle::Primary, true, colors)
+                            .on_click(cx.listener(|view, _, window, cx| view.open_update_dialog(window, cx)))
                     })))
                 .children(match &self.snapshot.update {
-                    UpdateStatus::Failed(message) => Some(div().text_size(px(12.)).text_color(colors.danger).child(message.clone())),
-                    UpdateStatus::Available { dmg: None, .. } => Some(div().text_size(px(12.)).text_color(colors.muted)
-                        .child("这个版本没有匹配当前架构的 DMG，可查看 GitHub 发布说明。")),
+                    UpdateStatus::Failed(error) | UpdateStatus::InstallFailed(_, error) =>
+                        Some(div().text_size(px(12.)).text_color(colors.danger).child(error.clone())),
                     _ => None,
                 }),
         )
@@ -3543,6 +3652,11 @@ impl Ui {
 
 impl Render for Ui {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(release) = self.snapshot.update.offer()
+            && self.snapshot.dismissed_update_version.as_ref() != Some(&release.version)
+        {
+            self.open_update_dialog(window, cx);
+        }
         let colors = Palette::for_theme(self.snapshot.theme(), window.appearance());
         let fullscreen = window.is_fullscreen();
         let sidebar_width = px(if self.sidebar_collapsed { 80. } else { 192. });
@@ -3585,7 +3699,6 @@ impl Render for Ui {
                     .min_h_0()
                     .flex()
                     .flex_col()
-                    .children(self.update_notice(colors, cx))
                     .child(
                         div()
                             .id(SharedString::from(format!("scroll-{scroll_id}")))
@@ -3603,6 +3716,7 @@ impl Render for Ui {
             )
             .child(self.sidebar_toggle(sidebar_width, colors, cx))
             .children(self.copy_feedback(window, colors))
+            .children(self.render_update_dialog(colors, cx).map(|dialog| deferred(dialog).with_priority(2)))
     }
 }
 
@@ -3699,8 +3813,10 @@ impl Render for SidebarTooltip {
 fn keyboard_focus(element: Stateful<Div>) -> Stateful<Div> {
     element.tab_index(0).capture_any_mouse_down(|_, window, _| {
         // GPUI transfers focus on mouse-down, before the click handler runs.
-        window.prevent_default();
-        window.blur();
+        if !window.default_prevented() {
+            window.prevent_default();
+            window.blur();
+        }
     })
 }
 
