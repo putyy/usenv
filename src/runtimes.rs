@@ -122,7 +122,9 @@ impl Mise {
         proxy: Option<&str>,
     ) -> Result<Vec<String>> {
         ensure!(Self::supports(environment), "该环境暂不支持 Mise");
-        let output = self.run(&["ls-remote", mise_install_name(environment)], false, proxy)?;
+        let selector = tool_selector(mise_install_name(environment));
+        let result = self.run(&["ls-remote", &selector], false, proxy);
+        let output = self.with_backend_hint(environment, result)?;
         let mut seen = BTreeSet::new();
         let mut versions: Vec<_> = output
             .lines()
@@ -153,10 +155,23 @@ impl Mise {
             valid_mise_version(version),
             "请输入 Mise 版本，如 latest、22 或 22.14.0"
         );
-        let tool = format!("{}@{version}", mise_install_name(environment));
+        let tool = format!("{}@{version}", tool_selector(mise_install_name(environment)));
         let mut command = self.command(&["install", &tool], false);
         command.env("MISE_RAW", "1").env("MISE_COLOR", "0");
-        command::stream(command, &format!("mise install {tool}"), proxy, log)
+        let result = command::stream(command, &format!("mise install {tool}"), proxy, log);
+        self.with_backend_hint(environment, result)
+    }
+
+    fn with_backend_hint<T>(&self, environment: Environment, result: Result<T>) -> Result<T> {
+        result.map_err(|error| {
+            if environment == Environment::Nginx && self.run(&["backends"], true, None)
+                .is_ok_and(|backends| !backends.split_whitespace().any(|backend| backend == "conda"))
+            {
+                error.context("当前 Mise 缺少 Nginx 所需的 conda 后端，请升级 Mise")
+            } else {
+                error
+            }
+        })
     }
 
     pub fn set_global(&self, environment: Environment, name: &str, version: &str) -> Result<()> {
@@ -170,7 +185,7 @@ impl Mise {
             }),
             "该 Mise 版本已不在安装列表中，请刷新"
         );
-        let tool = format!("{name}@{version}");
+        let tool = format!("{}@{version}", tool_selector(name));
         self.run(&["use", "--global", "--pin", &tool], true, None)?;
         Ok(())
     }
@@ -189,17 +204,16 @@ impl Mise {
         let globals = self.run(&["ls", "--global", "--installed", "--json"], true, None)?;
         let globals: MiseVersions = serde_json::from_str(&globals)
             .context("无法确认当前 Mise 全局版本")?;
-        ensure!(!globals.get(name).is_some_and(|entries| {
-            entries.iter().any(|entry| entry.version == version && entry.active)
-        }), "请先切换 {name} 的 Mise 全局版本");
+        ensure!(!inventory_entries(&globals, name)
+            .any(|entry| entry.version == version && entry.active),
+            "请先切换 {name} 的 Mise 全局版本");
         let output = self.run(&["ls", "--prunable", "--json"], true, None)
             .context("无法确认版本引用状态，请检查 Mise 版本后重试")?;
         let prunable: MiseVersions = serde_json::from_str(&output)
             .context("无法读取 Mise 可卸载版本列表")?;
-        ensure!(prunable.get(name).is_some_and(|entries| {
-            entries.iter().any(|entry| entry.version == version)
-        }), "{name} {version} 未列为可卸载版本，可能已被移除或仍被 Mise 配置引用");
-        let tool = format!("{name}@{version}");
+        ensure!(inventory_entries(&prunable, name).any(|entry| entry.version == version),
+            "{name} {version} 未列为可卸载版本，可能已被移除或仍被 Mise 配置引用");
+        let tool = format!("{}@{version}", tool_selector(name));
         let mut process = self.command(&["uninstall", &tool], true);
         process.env("MISE_COLOR", "0");
         command::stream(process, &format!("mise uninstall {tool}"), None, log)
@@ -225,14 +239,14 @@ impl Mise {
                 let install_path = entry.install_path.clone().filter(|path| path.is_absolute());
                 let (executable, cargo_executable) =
                     self.tool_paths(environment, name, &entry.version, install_path.as_deref());
-                let active = globals.map(|entries| entries.get(name).is_some_and(|versions| {
-                    versions.iter().any(|global| {
+                let active = globals.map(|entries| {
+                    inventory_entries(entries, name).any(|global| {
                         global.active
                             && global.installed
                             && global.version == entry.version
                             && global.install_path == entry.install_path
                     })
-                }));
+                });
                 tools.push(MiseTool {
                     environment,
                     name: name.clone(),
@@ -271,7 +285,7 @@ impl Mise {
                 .filter(|path| is_executable(path));
             return (executable, None);
         }
-        let tool = format!("{name}@{version}");
+        let tool = format!("{}@{version}", tool_selector(name));
         let selector = format!("--tool={tool}");
         if matches!(name, "rust" | "core:rust")
             && let Some(rustup) = self
@@ -345,8 +359,14 @@ fn mise_binary(environment: Environment) -> Option<&'static str> {
         Environment::Go => Some("go"),
         Environment::Rust => Some("rustc"),
         Environment::Flutter => Some("flutter"),
+        Environment::Php => Some("php"),
         Environment::Python => Some("python3"),
         Environment::Java => Some("java"),
+        Environment::Nginx => Some("nginx"),
+        Environment::Mysql => Some("mysqld"),
+        Environment::Redis => Some("redis-server"),
+        Environment::Postgresql => Some("postgres"),
+        Environment::Meilisearch => Some("meilisearch"),
         Environment::Elasticsearch => Some("elasticsearch"),
         _ => None,
     }
@@ -354,21 +374,68 @@ fn mise_binary(environment: Environment) -> Option<&'static str> {
 
 fn mise_install_name(environment: Environment) -> &'static str {
     match environment {
+        Environment::Nginx => "conda:nginx",
+        Environment::Mysql => "vfox:jdx/vfox-mysql",
+        Environment::Postgresql => "postgres",
+        Environment::Meilisearch => "github:meilisearch/meilisearch",
         // Older Mise releases map the shorthand to the archived asdf plugin.
         Environment::Elasticsearch => "vfox:jdx/vfox-elasticsearch",
         _ => environment.key(),
     }
 }
 
+// Older inventories may report a backend-qualified tool using its install directory key.
+fn backend_selector(name: &str) -> &str {
+    match name {
+        "conda-nginx" => "conda:nginx",
+        "conda-redis-server" => "conda:redis-server",
+        "conda-postgresql" => "conda:postgresql",
+        "conda-mysql-server" => "conda:mysql-server",
+        "github-meilisearch-meilisearch" => "github:meilisearch/meilisearch",
+        "vfox-jdx-vfox-mysql" => "vfox:jdx/vfox-mysql",
+        "vfox-jdx-vfox-elasticsearch" => "vfox:jdx/vfox-elasticsearch",
+        _ => name,
+    }
+}
+
+fn tool_selector(name: &str) -> std::borrow::Cow<'_, str> {
+    if let Some((backend, options)) = name.split_once('[') {
+        return format!("{}[{options}", backend_selector(backend)).into();
+    }
+    let backend = backend_selector(name);
+    if backend == "github:meilisearch/meilisearch" {
+        let arch = if cfg!(target_arch = "aarch64") { "apple-silicon" } else { "amd64" };
+        return format!("{backend}[asset_pattern=meilisearch-macos-{arch},bin=meilisearch]").into();
+    }
+    backend.into()
+}
+
 fn mise_environment(name: &str) -> Option<Environment> {
+    // Some Mise versions retain bracketed tool options in the inventory key.
+    // Preserve those options for commands and compare only the backend name here.
+    let name = name.split_once('[').map_or(name, |(backend, _)| backend);
+    let name = backend_selector(name);
     let short = match name.split_once(':') {
+        Some(("conda", "nginx")) => "nginx",
+        Some(("conda", "mysql-server"))
+        | Some(("vfox", "jdx/vfox-mysql"))
+        | Some(("asdf", "mise-plugins/mise-mysql")) => "mysql",
+        Some(("conda", "redis-server"))
+        | Some(("vfox", "jdx/vfox-redis" | "mise-plugins/vfox-redis"))
+        | Some(("asdf", "mise-plugins/mise-redis")) => "redis",
+        Some(("conda", "postgresql"))
+        | Some(("vfox", "jdx/vfox-postgres" | "mise-plugins/vfox-postgres"))
+        | Some(("asdf", "mise-plugins/mise-postgres")) => "postgresql",
+        Some(("vfox", "jdx/vfox-php" | "mise-plugins/vfox-php"))
+        | Some(("asdf", "mise-plugins/asdf-php")) => "php",
+        Some(("github", "meilisearch/meilisearch")) => "meilisearch",
         Some(("vfox", "jdx/vfox-elasticsearch"))
         | Some(("asdf", "mise-plugins/mise-elasticsearch")) => "elasticsearch",
         Some(("core" | "http" | "asdf" | "vfox", short)) => short,
         Some(_) => return None,
-        None if name == "vfox-jdx-vfox-elasticsearch" => "elasticsearch",
         None => name,
     };
+    let short = if short == "postgres" { "postgresql" } else { short };
     Environment::SIDEBAR
         .into_iter()
         .find(|environment| Mise::supports(*environment) && environment.key() == short)
@@ -397,6 +464,16 @@ struct MiseVersion {
 
 type MiseVersions = BTreeMap<String, Vec<MiseVersion>>;
 
+fn inventory_entries<'a>(
+    entries: &'a MiseVersions,
+    name: &'a str,
+) -> impl Iterator<Item = &'a MiseVersion> {
+    let selector = tool_selector(name);
+    entries.iter()
+        .filter(move |(key, _)| tool_selector(key) == selector)
+        .flat_map(|(_, versions)| versions)
+}
+
 fn version_numbers(version: Option<&str>) -> Vec<u32> {
     version
         .unwrap_or_default()
@@ -410,6 +487,22 @@ fn version_numbers(version: Option<&str>) -> Vec<u32> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn service_catalog_selectors_recognize_installed_backend_names() {
+        for environment in [Environment::Nginx, Environment::Mysql, Environment::Redis,
+            Environment::Postgresql, Environment::Meilisearch, Environment::Php]
+        {
+            let selector = tool_selector(mise_install_name(environment));
+            assert_eq!(mise_environment(&selector), Some(environment));
+            assert_eq!(tool_selector(&selector), selector);
+        }
+        assert_eq!(tool_selector("conda-nginx"), "conda:nginx");
+        assert_eq!(mise_environment("conda-redis-server"), Some(Environment::Redis));
+        assert_eq!(mise_environment("vfox-jdx-vfox-mysql"), Some(Environment::Mysql));
+        assert_eq!(mise_environment("conda:mariadb"), None);
+        assert_eq!(mise_environment("conda:mysql-client"), None);
+    }
 
     #[test]
     fn mise_catalog_reads_remote_versions_through_proxy_and_sorts_them() -> Result<()> {

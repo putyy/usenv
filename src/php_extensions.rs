@@ -268,7 +268,7 @@ pub fn apply(
         Operation::Install(version) => {
             ensure!(
                 matches!(info.state, ExtensionState::Missing | ExtensionState::Broken),
-                "这个扩展已由 Usenv 安装"
+                "这个扩展已安装"
             );
             install(
                 brew,
@@ -286,7 +286,7 @@ pub fn apply(
                 info.state == if enabled { ExtensionState::Disabled } else { ExtensionState::Enabled },
                 "这个扩展当前无法切换启用状态"
             );
-            let managed = managed.context("找不到 Usenv 扩展配置")?;
+            let managed = managed.context("找不到此扩展的托管配置")?;
             let old = ini_directive(extension, &module, managed.enabled)?;
             let new = ini_directive(extension, &module, enabled)?;
             let updated = managed.source.replacen(&old, &new, 1);
@@ -301,7 +301,7 @@ pub fn apply(
         Operation::Uninstall => {
             ensure!(
                 matches!(info.state, ExtensionState::Enabled | ExtensionState::Disabled | ExtensionState::Broken),
-                "这个扩展没有由 Usenv 安装"
+                "没有可卸载的托管扩展"
             );
             if managed.is_some() {
                 fs::remove_file(&ini).with_context(|| format!("无法移除 {}", ini.display()))?;
@@ -379,7 +379,7 @@ impl Target {
         ensure!(matches!(arch, "arm64" | "aarch64" | "x86_64"), "无法识别 PHP 架构");
         let data_dir = service_dir
             .parent()
-            .context("无法定位 Usenv 数据目录")?
+            .context("无法定位应用数据目录")?
             .join("php")
             .join(version_label)
             .join(arch);
@@ -711,7 +711,7 @@ fn install(
         format!("{INI_HEADER}\n; abi={}\n; version={version}\n{new_line}\n", target.runtime.abi)
     };
     ensure!(!entry_exists(&ini) || previous.is_some(), "扩展配置已由其他程序创建，请刷新后重试");
-    ensure!(!entry_exists(&module) || module_is_regular(&module), "Usenv 扩展文件不是普通文件");
+    ensure!(!entry_exists(&module) || module_is_regular(&module), "托管的扩展文件不是普通文件");
     let old_module = if module_is_regular(&module) {
         let backup = tempfile::NamedTempFile::new_in(&target.data_dir)?;
         fs::copy(&module, backup.path())?;
@@ -722,7 +722,7 @@ fn install(
     let new_module = tempfile::NamedTempFile::new_in(&target.data_dir)?;
     fs::copy(staged, new_module.path())?;
     new_module.as_file().sync_all()?;
-    new_module.persist(&module).context("无法保存 Usenv 扩展文件")?;
+    new_module.persist(&module).context("无法保存扩展文件")?;
     let result = atomic_write(&ini, updated.as_bytes()).and_then(|_| verify_loaded(target, extension, true, log));
     if let Err(error) = result {
         let restored = match old_module {

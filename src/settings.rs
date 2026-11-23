@@ -303,14 +303,14 @@ impl SettingsStore {
             .truncate(false)
             .mode(0o600)
             .open(self.data_dir.join(".settings.lock"))
-            .context("无法打开 usenv 配置锁")?;
-        file.lock().context("无法锁定 usenv 配置")?;
+            .context("无法打开应用配置锁")?;
+        file.lock().context("无法锁定应用配置")?;
         Ok(file)
     }
 
     fn read_preferences(&self) -> Result<Preferences> {
         match read_if_present(&self.data_dir.join("settings.json"))? {
-            Some(bytes) => serde_json::from_slice(&bytes).context("usenv 设置格式无效"),
+            Some(bytes) => serde_json::from_slice(&bytes).context("应用设置格式无效"),
             None => Ok(Preferences::default()),
         }
     }
@@ -332,8 +332,8 @@ impl SettingsStore {
             .unwrap_or_default();
         let json = first_line
             .strip_prefix(DEFAULTS_HEADER.as_bytes())
-            .context("usenv 默认版本文件缺少配置头")?;
-        serde_json::from_slice(json).context("usenv 默认版本配置格式无效")
+            .context("默认版本文件缺少配置头")?;
+        serde_json::from_slice(json).context("默认版本配置格式无效")
     }
 
     fn write_defaults(&self, defaults: &RuntimeDefaults) -> Result<()> {

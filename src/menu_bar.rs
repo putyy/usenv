@@ -104,7 +104,7 @@ fn menu_changed(before: &Snapshot, after: &Snapshot) -> bool {
 fn build_menu(snapshot: &Snapshot) -> Result<Menu> {
     let menu = Menu::new();
     let idle = snapshot.busy.is_none();
-    menu.append(&MenuItem::with_id(OPEN, "打开 Usenv", true, None))?;
+    menu.append(&MenuItem::with_id(OPEN, "主界面", true, None))?;
     menu.append(&MenuItem::with_id(REFRESH, "刷新环境", idle, None))?;
     menu.append(&PredefinedMenuItem::separator())?;
 
@@ -160,7 +160,7 @@ fn build_menu(snapshot: &Snapshot) -> Result<Menu> {
     }
 
     menu.append(&PredefinedMenuItem::separator())?;
-    menu.append(&MenuItem::with_id(QUIT, "退出 Usenv", idle && running + queued == 0, None))?;
+    menu.append(&MenuItem::with_id(QUIT, "退出", idle && running + queued == 0, None))?;
     if !snapshot.services.is_empty() {
         align_status_dots(&menu, first_service, &snapshot.services);
     }

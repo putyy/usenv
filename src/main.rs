@@ -5,6 +5,7 @@ mod command;
 mod config;
 mod controller;
 mod diagnostics;
+mod dock;
 mod elasticsearch;
 mod instance;
 mod language_tools;
@@ -29,36 +30,49 @@ use crate::ui::Ui;
 use objc2::MainThreadMarker;
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 
-actions!(usenv, [Quit, CloseWindow]);
+actions!(usenv, [Quit, HideToMenuBar, CloseWindow]);
 
 fn main() {
     let controller = Controller::new();
+    controller.submit(controller::Action::CheckUpdate);
     let app = Application::new();
     let reopened = controller.clone();
     app.on_reopen(move |cx| show_window(&reopened, cx));
     app.run(move |cx| {
         let quiet_login = controller.snapshot().settings.quiet_login && login::launched_at_login();
-        cx.bind_keys([
-            KeyBinding::new("cmd-q", Quit, None),
-            KeyBinding::new("cmd-w", CloseWindow, None),
-        ]);
+        cx.bind_keys([KeyBinding::new("cmd-w", CloseWindow, None)]);
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.on_action(|_: &CloseWindow, cx| {
             if let Some(window) = cx.active_window() {
                 let _ = window.update(cx, |_, window, _| window.remove_window());
             }
         });
+        let has_menu_bar = match menu_bar::install(controller.clone(), cx) {
+            Ok(()) => {
+                dock::install_quit_handler();
+                cx.on_window_closed(|cx| {
+                    if cx.windows().is_empty() {
+                        set_activation_policy(NSApplicationActivationPolicy::Accessory);
+                    }
+                })
+                .detach();
+                cx.bind_keys([KeyBinding::new("cmd-q", HideToMenuBar, None)]);
+                cx.on_action(|_: &HideToMenuBar, _| dock::hide_to_menu_bar());
+                true
+            }
+            Err(error) => {
+                eprintln!("usenv 菜单栏启动失败：{error:#}");
+                cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+                false
+            }
+        };
         cx.set_menus(vec![Menu {
             name: "Usenv".into(),
-            items: vec![MenuItem::action("退出 Usenv", Quit)],
+            items: vec![MenuItem::action("退出", Quit)],
         }]);
-        match menu_bar::install(controller.clone(), cx) {
-            Ok(()) if quiet_login => {
-                set_activation_policy(NSApplicationActivationPolicy::Accessory);
-                return;
-            }
-            Err(error) => eprintln!("usenv 菜单栏启动失败：{error:#}"),
-            Ok(()) => {}
+        if quiet_login && has_menu_bar {
+            set_activation_policy(NSApplicationActivationPolicy::Accessory);
+            return;
         }
         show_window(&controller, cx);
     });
@@ -73,6 +87,10 @@ fn set_activation_policy(policy: NSApplicationActivationPolicy) {
 
 fn show_window(controller: &Controller, cx: &mut App) {
     set_activation_policy(NSApplicationActivationPolicy::Regular);
+    let app = NSApplication::sharedApplication(MainThreadMarker::new().expect("GPUI main thread"));
+    if app.isHidden() {
+        app.unhide(None);
+    }
     if let Some(handle) = cx.windows().first().copied() {
         let _ = handle.update(cx, |_, window, _| window.activate_window());
         cx.activate(true);

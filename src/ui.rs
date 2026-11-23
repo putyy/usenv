@@ -1,5 +1,6 @@
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
@@ -89,6 +90,7 @@ struct Palette {
     control_hover: Rgba,
     ink: Rgba,
     muted: Rgba,
+    placeholder: Rgba,
     accent: Rgba,
     accent_hover: Rgba,
     accent_text: Rgba,
@@ -120,6 +122,7 @@ impl Palette {
                 control_hover: rgb(0x3d3d3d),
                 ink: rgb(0xe2e2e2),
                 muted: rgb(0xa7a7a7),
+                placeholder: rgb(0xa7a7a7),
                 accent: rgb(0xa6c0ff),
                 accent_hover: rgb(0xbbceff),
                 accent_text: rgb(0x18243b),
@@ -128,22 +131,24 @@ impl Palette {
                 danger: rgb(0xff9ca9),
             }
         } else {
+            let panel_background = rgb(0xededef);
             Self {
-                background: rgb(0xffffff),
-                sidebar: rgb(0xfafafa),
+                background: rgb(0xf6f6f7),
+                sidebar: panel_background,
                 sidebar_ink: rgb(0x595a5a),
-                sidebar_selected: rgb(0xeff0f0),
+                sidebar_selected: rgb(0xd9dadd),
                 sidebar_selected_ink: rgb(0x262626),
-                sidebar_hover: rgb(0xf4f4f4),
-                surface: rgb(0xf6f6f6),
-                control: rgb(0xebebeb),
-                control_hover: rgb(0xe0e0e0),
+                sidebar_hover: rgb(0xe3e4e7),
+                surface: panel_background,
+                control: rgb(0xe3e4e7),
+                control_hover: rgb(0xd7d9de),
                 ink: rgb(0x4a4a4a),
                 muted: rgb(0x686868),
+                placeholder: rgb(0x707276),
                 accent: rgb(0x385fa6),
                 accent_hover: rgb(0x2e508e),
                 accent_text: rgb(0xffffff),
-                accent_soft: rgb(0xe6edf8),
+                accent_soft: rgb(0xdbe4f3),
                 success: rgb(0x167657),
                 danger: rgb(0xa83450),
             }
@@ -283,7 +288,7 @@ impl Ui {
             && (self.proxy.text == self.snapshot.settings.proxy
                 || self.proxy.text.trim() == snapshot.settings.proxy)
         {
-            self.proxy = LineEditor::new(snapshot.settings.proxy.clone());
+            self.proxy.sync_text(&snapshot.settings.proxy);
         }
         let saved = self.snapshot.brew_preferences();
         if let Some(preferences) = snapshot.brew_preferences()
@@ -293,8 +298,8 @@ impl Ui {
             if saved == Some(&draft) || Some(preferences) == Some(&draft)
                 || (saved.is_none() && draft == BrewPreferences::default())
             {
-                self.brew_api_mirror = LineEditor::new(preferences.api_mirror.clone());
-                self.brew_bottle_mirror = LineEditor::new(preferences.bottle_mirror.clone());
+                self.brew_api_mirror.sync_text(&preferences.api_mirror);
+                self.brew_bottle_mirror.sync_text(&preferences.bottle_mirror);
                 self.brew_disable_auto_update = preferences.disable_auto_update;
             }
         }
@@ -358,6 +363,12 @@ impl Ui {
                 let title = format!("{label} {target}？");
                 let detail = if label == "升级" {
                     "Homebrew 将更新这条公式。服务需要先停止并关闭登录启动。"
+                } else if matches!(&action, Action::UninstallMise(env, ..)
+                    if env.service_label().is_some() && *env != Environment::Elasticsearch)
+                {
+                    "Mise 会移除该版本的安装目录和其中的文件。请先停止使用此版本的服务，并备份保存在安装目录中的配置和数据。"
+                } else if matches!(&action, Action::UninstallMise(..)) {
+                    "Mise 会移除所选版本的安装目录。"
                 } else {
                     "卸载会移除选中的程序版本。服务的配置和数据目录会保留。"
                 };
@@ -1870,7 +1881,7 @@ impl Ui {
                     }));
         } else {
             body = body.child(div().text_color(colors.muted)
-                .child("安装 Nginx 和 PHP 后，可为本地项目生成站点配置。"));
+                .child("通过 Homebrew 安装 Nginx 和 PHP 后，可为本地项目生成站点配置。"));
         }
         if let Some(site) = &self.snapshot.site {
             body = body
@@ -2130,7 +2141,12 @@ impl Ui {
                     div()
                         .text_size(px(12.))
                         .text_color(colors.muted)
-                        .child("升级可选择新版本安装，再切换全局版本。输入版本号或渠道，留空安装 latest。"),
+                        .child(match environment {
+                            Environment::Elasticsearch => "选择单节点服务版本，留空安装 latest。",
+                            Environment::Nginx => "Mise 通过 conda:nginx 提供多个版本。全局版本用于终端，页面上的启停按钮管理 Homebrew 服务。",
+                            env if env.service_label().is_some() => "Mise 全局版本用于终端，页面上的启停按钮管理 Homebrew 服务。留空安装 latest。",
+                            _ => "升级可选择新版本安装，再切换全局版本。输入版本号或渠道，留空安装 latest。",
+                        }),
                 )
                 .children(
                     self.mise_list_open
@@ -2267,7 +2283,7 @@ impl Ui {
                                 row.cursor_pointer()
                                     .hover(move |style| style.bg(colors.control))
                                     .on_click(cx.listener(move |view, _, window, cx| {
-                                        view.mise_version = LineEditor::new(selected.clone());
+                                        view.mise_version.replace_all(&selected);
                                         view.mise_list_open = false;
                                         view.mise_focus.focus(window);
                                         cx.notify();
@@ -2371,7 +2387,13 @@ impl Ui {
             .as_ref()
             .map(|path| path.display().to_string());
         let versions = if installed {
-            formula.installed_versions.join(" · ")
+            let local = formula.installed_versions.join(" · ");
+            match &formula.version {
+                Some(catalog) if formula.installable && !formula.installed_versions.contains(catalog) => {
+                    format!("已安装 {local} · 目录版本 {catalog}")
+                }
+                _ => local,
+            }
         } else {
             formula.version.clone().unwrap_or_else(|| "版本未知".into())
         };
@@ -2591,10 +2613,10 @@ impl Ui {
             .filter(|service| service.environment == environment)
             .peekable();
         let empty = services.peek().is_none();
-        let title = if environment == Environment::Php {
-            label
-        } else {
-            "本地服务"
+        let title = match environment {
+            Environment::Elasticsearch => "本地服务",
+            Environment::Php => "Homebrew · PHP-FPM",
+            _ => "Homebrew 服务",
         };
         section(title, colors.muted).child(
             card_list()
@@ -2603,7 +2625,7 @@ impl Ui {
                         .px_4()
                         .py_3()
                         .text_color(colors.muted)
-                        .child("未检测到已安装的服务")
+                        .child(format!("未检测到已安装的 {label} 服务"))
                 }))
                 .children(services.map(|service| self.service(service, colors, cx))),
         )
@@ -2812,7 +2834,7 @@ impl Ui {
                     .text_color(colors.muted)
                     .child(
                         if service.backend == ServiceBackend::MiseLaunchd || managed {
-                            "usenv 独立实例"
+                            "独立实例"
                         } else {
                             "Homebrew 配置"
                         },
@@ -3044,7 +3066,7 @@ impl Ui {
             Manager::Homebrew => (
                 "Homebrew",
                 self.snapshot.brew_path.as_deref(),
-                "在系统终端按提示安装，可能需要管理员密码。完成后 Usenv 会自动检测。",
+                "在系统终端按提示安装，可能需要管理员密码。完成后会自动检测。",
                 "在终端安装",
                 Action::OpenHomebrewInstaller,
                 setup::HOMEBREW_MANUAL,
@@ -3053,7 +3075,7 @@ impl Ui {
             Manager::Mise => (
                 "Mise",
                 self.snapshot.mise.as_ref().map(Mise::path),
-                "可独立安装。装好后即可在 usenv 中选择和管理语言版本。",
+                "可独立安装，用于管理语言运行时和 Nginx、MySQL 等工具的版本。",
                 "安装 Mise",
                 Action::InstallMiseManager,
                 setup::MISE_MANUAL,
@@ -3229,7 +3251,7 @@ impl Ui {
                     Action::SaveBrewPreferences(draft), colors, cx,
                 )))
             .child(div().text_size(px(12.)).text_color(colors.muted)
-                .child("保存到用户 brew.env，Usenv 和终端里的 brew 都可以读取。镜像留空时沿用已有配置。"))
+                .child("保存到用户 brew.env，终端里的 brew 也会使用这些设置。镜像留空时沿用已有配置。"))
     }
 
     fn mise_configuration(&self, colors: Palette, cx: &Context<Self>) -> Div {
@@ -3327,7 +3349,7 @@ impl Ui {
                         )
                         .child(
                             div().text_size(px(12.)).text_color(colors.muted).child(
-                                "用于 Homebrew 和 Mise 安装及版本查询。留空后保存可清除代理。",
+                                "用于应用更新检查，以及 Homebrew 和 Mise 的安装和版本查询。留空后保存可清除代理。",
                             ),
                         )
                         .child(self.install_parallelism(colors, cx)),
@@ -3349,17 +3371,13 @@ impl Ui {
                                 .child(
                                     div()
                                         .font_weight(FontWeight::SEMIBOLD)
-                                        .child("登录时启动 usenv"),
+                                        .child("登陆时启动"),
                                 )
-                                .child(div().text_size(px(12.)).text_color(colors.muted).child(
-                                    match login {
-                                        LoginStatus::Unavailable => "使用 Usenv.app 启动后可设置。",
-                                        LoginStatus::PendingApproval => {
-                                            "请在系统设置的「登录项与扩展」中允许 usenv。"
-                                        }
-                                        _ => "登录时自动打开 usenv。",
-                                    },
-                                )),
+                                .children(match login {
+                                    LoginStatus::Unavailable => Some("使用 Usenv.app 启动后可设置。"),
+                                    LoginStatus::PendingApproval => Some("请在系统设置的「登录项与扩展」中允许 Usenv。"),
+                                    _ => None,
+                                }.map(|hint| div().text_size(px(12.)).text_color(colors.muted).child(hint))),
                         )
                         .child(self.action_button(
                             "login-app",
@@ -3381,12 +3399,12 @@ impl Ui {
                 ).child(
                     panel(colors).p_4().flex().items_center().justify_between().gap_3()
                         .child(div().flex().flex_col().gap_1()
-                            .child(div().font_weight(FontWeight::SEMIBOLD).child("登录时仅显示菜单栏"))
+                            .child(div().font_weight(FontWeight::SEMIBOLD).child("登陆时仅显示菜单栏"))
                             .child(div().text_size(px(12.)).text_color(colors.muted).child(
                                 if login == LoginStatus::Enabled {
-                                    "需要窗口时，可从菜单栏打开 Usenv。"
+                                    "从菜单栏选择「主界面」可打开窗口。"
                                 } else {
-                                    "开启「登录时启动 usenv」并允许登录项后可设置。"
+                                    "开启「登陆时启动」并允许登录项后可设置。"
                                 },
                             )))
                         .child(self.action_button(
@@ -3422,6 +3440,27 @@ impl Ui {
                     view.sync(cx);
                 }))
             })))
+    }
+
+    fn update_notice(&self, colors: Palette, cx: &Context<Self>) -> Option<Div> {
+        let UpdateStatus::Available { version, page, dmg } = &self.snapshot.update else {
+            return None;
+        };
+        if self.snapshot.dismissed_update_version.as_ref() == Some(version) {
+            return None;
+        }
+        let label = if dmg.is_some() { "下载 DMG" } else { "发布说明" };
+        let url = dmg.as_ref().unwrap_or(page).clone();
+        let version = version.clone();
+        Some(panel(colors).mx_7().mt_3().px_3().py_2().flex().items_center().gap_2()
+            .child(div().flex_1().child(format!("发现新版本 {version}")))
+            .child(button("open-available-update", label, ButtonStyle::Primary, true, colors)
+                .on_click(move |_, _, cx| cx.open_url(&url)))
+            .child(button("dismiss-update", "稍后", ButtonStyle::Plain, true, colors)
+                .on_click(cx.listener(move |view, _, _, cx| {
+                    view.controller.dismiss_update_notice(&version);
+                    view.sync(cx);
+                }))))
     }
 
     fn update_preferences(&self, colors: Palette, cx: &Context<Self>) -> Div {
@@ -3471,7 +3510,7 @@ impl Ui {
                 cx.stop_propagation();
             }
             "escape" => {
-                self.proxy = LineEditor::new(self.snapshot.settings.proxy.clone());
+                self.proxy.replace_all(&self.snapshot.settings.proxy);
                 cx.stop_propagation();
                 cx.notify();
             }
@@ -3493,7 +3532,7 @@ impl Ui {
                 cx.stop_propagation();
             }
             "escape" => {
-                self.mise_version = LineEditor::default();
+                self.mise_version.replace_all("");
                 cx.stop_propagation();
                 cx.notify();
             }
@@ -3546,6 +3585,7 @@ impl Render for Ui {
                     .min_h_0()
                     .flex()
                     .flex_col()
+                    .children(self.update_notice(colors, cx))
                     .child(
                         div()
                             .id(SharedString::from(format!("scroll-{scroll_id}")))
@@ -3748,11 +3788,21 @@ fn copy_control(
         }))
 }
 
+struct TextEdit {
+    start: usize,
+    removed: String,
+    inserted: String,
+    cursor_before: usize,
+    anchor_before: usize,
+}
+
 #[derive(Default)]
 struct LineEditor {
     text: String,
     cursor: usize,
     anchor: usize,
+    undo: VecDeque<TextEdit>,
+    redo: Vec<TextEdit>,
 }
 
 impl LineEditor {
@@ -3762,6 +3812,13 @@ impl LineEditor {
             text,
             cursor: end,
             anchor: end,
+            ..Self::default()
+        }
+    }
+
+    fn sync_text(&mut self, saved: &str) {
+        if self.text != saved {
+            *self = Self::new(saved.to_owned());
         }
     }
 
@@ -3777,6 +3834,13 @@ impl LineEditor {
     fn key(&mut self, event: &KeyDownEvent, cx: &mut Context<Ui>) {
         let key = &event.keystroke;
         match (key.key.as_str(), key.modifiers.platform) {
+            ("z", true) if !key.modifiers.alt && !key.modifiers.control => {
+                if key.modifiers.shift {
+                    self.redo();
+                } else {
+                    self.undo();
+                }
+            }
             ("a", true) => {
                 self.anchor = 0;
                 self.cursor = self.text.len();
@@ -3784,15 +3848,16 @@ impl LineEditor {
             ("c" | "x", true) => {
                 let range = self.selection();
                 if !range.is_empty() {
-                    cx.write_to_clipboard(ClipboardItem::new_string(self.text[range].into()));
+                    let selected = self.text[range.clone()].to_owned();
+                    cx.write_to_clipboard(ClipboardItem::new_string(selected));
                     if key.key == "x" {
-                        self.replace("");
+                        self.replace(range, "");
                     }
                 }
             }
             ("v", true) => {
                 if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-                    self.replace(&text);
+                    self.replace(self.selection(), &text);
                 }
             }
             ("left" | "right" | "home" | "end", _) => {
@@ -3810,18 +3875,21 @@ impl LineEditor {
                 self.move_to(position, key.modifiers.shift);
             }
             ("backspace" | "delete", _) => {
-                if self.selection().is_empty() {
-                    self.anchor = if key.key == "backspace" {
-                        self.previous()
+                let mut range = self.selection();
+                if range.is_empty() {
+                    if key.key == "backspace" {
+                        range.start = self.previous();
                     } else {
-                        self.next()
-                    };
+                        range.end = self.next();
+                    }
                 }
-                self.replace("");
+                self.replace(range, "");
             }
             _ if !key.modifiers.platform && !key.modifiers.control => match key.key_char.as_deref()
             {
-                Some(text) if !text.chars().any(char::is_control) => self.replace(text),
+                Some(text) if !text.chars().any(char::is_control) => {
+                    self.replace(self.selection(), text);
+                }
                 _ => return,
             },
             _ => return,
@@ -3840,9 +3908,15 @@ impl LineEditor {
         colors: Palette,
     ) -> Stateful<Div> {
         let focused = focus.is_focused(window);
+        let field_focus = focus.clone();
         div()
             .id(id)
             .track_focus(focus)
+            .on_mouse_down_out(move |_, window, _| {
+                if field_focus.is_focused(window) {
+                    window.blur();
+                }
+            })
             .tab_index(0)
             .flex_1()
             .min_w_0()
@@ -3863,7 +3937,7 @@ impl LineEditor {
             .child(self.display(focused, placeholder, columns, colors))
     }
 
-    fn selection(&self) -> std::ops::Range<usize> {
+    fn selection(&self) -> Range<usize> {
         self.cursor.min(self.anchor)..self.cursor.max(self.anchor)
     }
 
@@ -3888,16 +3962,52 @@ impl LineEditor {
         }
     }
 
-    fn replace(&mut self, text: &str) {
-        let range = self.selection();
+    fn replace_all(&mut self, text: &str) {
+        self.replace(0..self.text.len(), text);
+    }
+
+    fn replace(&mut self, range: Range<usize>, text: &str) {
         let text: String = text
             .trim_matches(['\r', '\n'])
             .chars()
             .filter(|ch| !ch.is_control())
             .collect();
         let cursor = range.start + text.len();
-        self.text.replace_range(range, &text);
+        if &self.text[range.clone()] != text.as_str() {
+            let edit = TextEdit {
+                start: range.start,
+                removed: self.text[range.clone()].to_owned(),
+                inserted: text,
+                cursor_before: self.cursor,
+                anchor_before: self.anchor,
+            };
+            self.text.replace_range(range, &edit.inserted);
+            if self.undo.len() == 128 {
+                self.undo.pop_front();
+            }
+            self.undo.push_back(edit);
+            self.redo.clear();
+        }
         self.move_to(cursor, false);
+    }
+
+    fn undo(&mut self) {
+        if let Some(edit) = self.undo.pop_back() {
+            let range = edit.start..edit.start + edit.inserted.len();
+            self.text.replace_range(range, &edit.removed);
+            self.cursor = edit.cursor_before;
+            self.anchor = edit.anchor_before;
+            self.redo.push(edit);
+        }
+    }
+
+    fn redo(&mut self) {
+        if let Some(edit) = self.redo.pop() {
+            let range = edit.start..edit.start + edit.removed.len();
+            self.text.replace_range(range, &edit.inserted);
+            self.move_to(edit.start + edit.inserted.len(), false);
+            self.undo.push_back(edit);
+        }
     }
 
     fn display(&self, focused: bool, placeholder: &str, columns: usize, colors: Palette) -> Div {
@@ -3912,7 +4022,7 @@ impl LineEditor {
             return row
                 .min_w_0()
                 .gap_1()
-                .text_color(colors.muted)
+                .text_color(colors.placeholder)
                 .children(focused.then(caret))
                 .child(placeholder.to_owned());
         }

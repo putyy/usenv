@@ -55,6 +55,7 @@ pub struct Snapshot {
     pub current_java: CurrentJavaStatus,
     pub service_report: Option<(String, ServiceReport)>,
     pub update: UpdateStatus,
+    pub dismissed_update_version: Option<String>,
     pub site: Option<Site>,
     pending_visibility: BTreeMap<Environment, (u64, bool)>,
     pending_theme: Option<(u64, Theme)>,
@@ -613,7 +614,7 @@ impl Action {
             Self::CheckTerminal(environment, _) => format!("正在检查终端中的 {}…", environment.label()),
             Self::ReadCurrentJava => "正在读取终端中的 Java…".into(),
             Self::DiagnoseService(formula) => format!("正在读取 {formula} 服务详情…"),
-            Self::CheckUpdate => "正在检查 Usenv 更新…".into(),
+            Self::CheckUpdate => "正在检查应用更新…".into(),
             Self::CreateSite { .. } => "正在生成本地站点配置…".into(),
             Self::OpenSite => "正在打开站点配置…".into(),
             Self::InspectRuntime(_) => "正在读取工具和扩展…".into(),
@@ -711,6 +712,12 @@ impl Controller {
 
     pub fn snapshot(&self) -> Snapshot {
         self.state.lock().unwrap().clone()
+    }
+
+    pub fn dismiss_update_notice(&self, version: &str) {
+        let mut state = self.state.lock().unwrap();
+        state.dismissed_update_version = Some(version.to_owned());
+        state.generation += 1;
     }
 
     pub fn snapshot_if_changed(&self, generation: u64) -> Option<Snapshot> {
@@ -817,7 +824,7 @@ impl Controller {
                 sender: self.sender.clone(),
             });
             if self.sender.send(request).is_err() {
-                fail_task(&mut state, id, "安装队列已停止，请重新打开 Usenv。".into());
+                fail_task(&mut state, id, "安装队列已停止，请重新打开应用。".into());
             }
             return;
         }
@@ -835,7 +842,7 @@ impl Controller {
         if self.sender.send(Request::Action(action)).is_err() {
             state.busy = None;
             state.service_operation = None;
-            state.error = Some("后台操作已停止，请重新打开 usenv。".into());
+            state.error = Some("后台操作已停止，请重新打开应用。".into());
         }
     }
 
@@ -871,7 +878,7 @@ impl Controller {
             state.generation += 1;
             let job = QueuedInstall { id, scope, action, sender: self.sender.clone() };
             if self.sender.send(Request::QueueInstall(job)).is_err() {
-                fail_task(&mut state, id, "后台任务已停止，请重新打开 Usenv。".into());
+                fail_task(&mut state, id, "后台任务已停止，请重新打开应用。".into());
             }
         } else if task.status == TaskStatus::Failed {
             drop(state);
@@ -909,7 +916,7 @@ impl Controller {
                 }
             }
         } else {
-            state.error = Some("后台操作已停止，请重新打开 usenv。".into());
+            state.error = Some("后台操作已停止，请重新打开应用。".into());
         }
     }
 }
@@ -996,6 +1003,7 @@ fn run_worker(
                     state.current_java.clone()
                 };
                 snapshot.update = state.update.clone();
+                snapshot.dismissed_update_version = state.dismissed_update_version.clone();
                 if let Some(id) = tools_task
                     && let Some(task) = snapshot.output_tasks.iter_mut().find(|task| task.id == id)
                 {
@@ -1848,7 +1856,7 @@ fn execute(
             snapshot.settings = store.set_service_managed(&formula, enabled)?;
             snapshot.invalidate_paths(&formula);
             snapshot.notice = Some(if enabled {
-                format!("{formula} 启动时将使用 usenv 的配置和目录")
+                format!("{formula} 启动时将使用独立实例的配置和目录")
             } else {
                 format!("{formula} 已恢复使用 Homebrew 配置，独立实例的文件已保留")
             });
@@ -1878,9 +1886,9 @@ fn execute(
             operation?;
             snapshot.notice = Some(
                 if enabled {
-                    "usenv 将在登录时启动"
+                    "已开启登陆时启动"
                 } else {
-                    "已关闭 usenv 登录启动"
+                    "已关闭登陆时启动"
                 }
                 .into(),
             );

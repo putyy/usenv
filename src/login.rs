@@ -73,12 +73,12 @@ pub fn set_enabled(enabled: bool) -> Result<()> {
         }
         let status = unsafe { service.status() };
         if enabled && status == SMAppServiceStatus::RequiresApproval {
-            bail!("请在 macOS「系统设置 → 通用 → 登录项与扩展」中允许 usenv");
+            bail!("请在 macOS「系统设置 → 通用 → 登录项与扩展」中允许 Usenv");
         }
         let registered =
             status == SMAppServiceStatus::Enabled || status == SMAppServiceStatus::RequiresApproval;
         if registered != enabled {
-            bail!("macOS 未能更新 usenv 的登录项状态");
+            bail!("macOS 未能更新登录项状态");
         }
         Ok(())
     })
