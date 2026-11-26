@@ -20,6 +20,8 @@ mod sites;
 mod ui;
 mod updates;
 
+use std::time::Duration;
+
 use gpui::{
     App, AppContext as _, Application, Bounds, KeyBinding, Menu, MenuItem, TitlebarOptions,
     WindowBounds, WindowOptions, actions, point, px, size,
@@ -27,19 +29,34 @@ use gpui::{
 
 use crate::controller::Controller;
 use crate::ui::Ui;
+use crate::updates::UpdateStatus;
 use objc2::MainThreadMarker;
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 
 actions!(usenv, [Quit, HideToMenuBar, CloseWindow]);
 
+const LOGIN_UPDATE_DELAY: Duration = Duration::from_secs(60);
+
 fn main() {
     let controller = Controller::new();
-    controller.submit(controller::Action::CheckUpdate);
     let app = Application::new();
     let reopened = controller.clone();
     app.on_reopen(move |cx| show_window(&reopened, cx));
     app.run(move |cx| {
-        let quiet_login = controller.snapshot().settings.quiet_login && login::launched_at_login();
+        let at_login = login::launched_at_login();
+        let quiet_login = at_login && controller.snapshot().settings.quiet_login;
+        if at_login {
+            let controller = controller.clone();
+            let delay = cx.background_executor().timer(LOGIN_UPDATE_DELAY);
+            cx.spawn(async move |_| {
+                delay.await;
+                if matches!(controller.snapshot().update, UpdateStatus::Idle | UpdateStatus::Failed(_)) {
+                    controller.submit(controller::Action::CheckUpdate);
+                }
+            }).detach();
+        } else {
+            controller.submit(controller::Action::CheckUpdate);
+        }
         cx.bind_keys([KeyBinding::new("cmd-w", CloseWindow, None)]);
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.on_action(|_: &CloseWindow, cx| {

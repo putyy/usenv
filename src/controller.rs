@@ -22,7 +22,7 @@ use crate::runtimes::{Mise, MiseTool};
 use crate::settings::{MAX_PARALLEL_INSTALLS, MIN_PARALLEL_INSTALLS, Settings, SettingsStore, ShellFile, Theme};
 use crate::setup;
 use crate::sites::{self, Site};
-use crate::updates::{self, UpdateStatus};
+use crate::updates::{self, UpdatePhase, UpdateStatus};
 pub use crate::language_tools::DeveloperTool;
 
 #[derive(Clone, Default)]
@@ -450,8 +450,17 @@ impl Snapshot {
         }).map(|task| task.status)
     }
 
+    fn set_update_phase(&mut self, next: UpdatePhase) {
+        if let UpdateStatus::InProgress(_, phase) = &mut self.update
+            && *phase != next
+        {
+            *phase = next;
+            self.generation += 1;
+        }
+    }
+
     pub fn action_available(&self, action: &Action) -> bool {
-        if matches!(self.update, UpdateStatus::Installing) {
+        if self.update.phase() == Some(UpdatePhase::Installing) {
             return false;
         }
         if self.brew_detection_failed
@@ -466,7 +475,7 @@ impl Snapshot {
             return false;
         }
         if matches!(action, Action::CheckUpdate) {
-            return !matches!(self.update, UpdateStatus::Checking) && self.update.progress().is_none();
+            return !matches!(self.update, UpdateStatus::Checking) && self.update.phase().is_none();
         }
         if matches!(action, Action::ReadCurrentJava) {
             return !matches!(self.current_java, CurrentJavaStatus::Checking(_));
@@ -730,25 +739,25 @@ impl Controller {
             let Some(release) = state.update.offer().filter(|r| r.version == version).cloned() else {
                 return false;
             };
-            state.update = UpdateStatus::Downloading;
+            let Some(asset) = &release.dmg else { return false };
+            state.update = UpdateStatus::InProgress(
+                release.clone(), UpdatePhase::Downloading { received: 0, total: asset.size },
+            );
             state.generation += 1;
             (release, state.settings.proxy.clone())
         };
-        let result = updates::prepare(&release, Some(&address)).and_then(|prepared| {
+        let report = |phase| self.state.lock().unwrap().set_update_phase(phase);
+        let result = updates::prepare(&release, Some(&address), report).and_then(|prepared| {
             loop {
                 let mut state = self.state.lock().unwrap();
                 let pending = state.busy.is_some() || state.output_tasks.iter().any(|task| task.status.active())
                     || !state.pending_visibility.is_empty() || state.pending_theme.is_some()
                     || state.pending_parallel_installs.is_some();
                 if !pending {
-                    state.update = UpdateStatus::Installing;
-                    state.generation += 1;
+                    state.set_update_phase(UpdatePhase::Installing);
                     break;
                 }
-                if !matches!(state.update, UpdateStatus::Waiting) {
-                    state.update = UpdateStatus::Waiting;
-                    state.generation += 1;
-                }
+                state.set_update_phase(UpdatePhase::Waiting);
                 drop(state);
                 std::thread::sleep(Duration::from_millis(250));
             }
@@ -905,7 +914,7 @@ impl Controller {
 
     pub fn retry_task(&self, id: u64) {
         let mut state = self.state.lock().unwrap();
-        if matches!(state.update, UpdateStatus::Installing) {
+        if state.update.phase() == Some(UpdatePhase::Installing) {
             return;
         }
         let Some(index) = state.output_tasks.iter().position(|task| task.id == id) else {
@@ -936,7 +945,7 @@ impl Controller {
 
     pub fn set_preference(&self, preference: Preference) {
         let mut state = self.state.lock().unwrap();
-        if matches!(state.update, UpdateStatus::Installing) {
+        if state.update.phase() == Some(UpdatePhase::Installing) {
             return;
         }
         if let Preference::ParallelInstalls(limit) = preference

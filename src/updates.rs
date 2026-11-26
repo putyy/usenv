@@ -5,6 +5,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
@@ -25,9 +26,7 @@ pub enum UpdateStatus {
     NoRelease,
     Current,
     Available(AvailableUpdate),
-    Downloading,
-    Waiting,
-    Installing,
+    InProgress(AvailableUpdate, UpdatePhase),
     InstallFailed(AvailableUpdate, String),
     Failed(String),
 }
@@ -44,7 +43,29 @@ pub struct AvailableUpdate {
 pub struct Download {
     url: String,
     digest: String,
-    size: u64,
+    pub size: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum UpdatePhase {
+    Downloading { received: u64, total: u64 },
+    Verifying,
+    Waiting,
+    Installing,
+}
+
+impl UpdatePhase {
+    pub fn label(self) -> String {
+        match self {
+            Self::Downloading { received, total } => {
+                let percent = u128::from(received.min(total)) * 100 / u128::from(total);
+                format!("正在下载更新 · {percent}%")
+            }
+            Self::Verifying => "正在校验更新…".into(),
+            Self::Waiting => "更新已就绪，等待当前任务完成…".into(),
+            Self::Installing => "正在安装更新并重新启动 Usenv…".into(),
+        }
+    }
 }
 
 impl UpdateStatus {
@@ -55,11 +76,16 @@ impl UpdateStatus {
         }
     }
 
-    pub fn progress(&self) -> Option<&'static str> {
+    pub fn release(&self) -> Option<&AvailableUpdate> {
         match self {
-            Self::Downloading => Some("正在后台下载并校验更新…"),
-            Self::Waiting => Some("更新已就绪，等待当前任务完成…"),
-            Self::Installing => Some("正在安装更新并重新启动 Usenv…"),
+            Self::InProgress(release, _) => Some(release),
+            _ => self.offer(),
+        }
+    }
+
+    pub fn phase(&self) -> Option<UpdatePhase> {
+        match self {
+            Self::InProgress(_, phase) => Some(*phase),
             _ => None,
         }
     }
@@ -189,7 +215,11 @@ pub struct PreparedUpdate {
     _lock: File,
 }
 
-pub fn prepare(release: &AvailableUpdate, proxy: Option<&str>) -> Result<PreparedUpdate> {
+pub fn prepare(
+    release: &AvailableUpdate,
+    proxy: Option<&str>,
+    report: impl Fn(UpdatePhase),
+) -> Result<PreparedUpdate> {
     let asset = release.dmg.as_ref().context("没有匹配当前架构且可校验的安装包")?;
     let bundle = installed_bundle()?;
     let lock = File::open(bundle.join("Contents/MacOS/usenv"))?;
@@ -207,7 +237,18 @@ pub fn prepare(release: &AvailableUpdate, proxy: Option<&str>) -> Result<Prepare
         "--proto", "=https", "--proto-redir", "=https", "--connect-timeout", "15",
         "--max-time", "900", "--max-filesize"])
         .arg(asset.size.to_string()).arg("--output").arg(&dmg).arg(&asset.url);
-    command::output(curl, "下载 Usenv 更新", proxy)?;
+    std::thread::scope(|scope| -> Result<()> {
+        let download = scope.spawn(move || command::output(curl, "下载 Usenv 更新", proxy));
+        while !download.is_finished() {
+            if let Ok(file) = fs::metadata(&dmg) {
+                report(UpdatePhase::Downloading { received: file.len().min(asset.size), total: asset.size });
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        download.join().map_err(|_| anyhow::anyhow!("下载线程意外退出"))??;
+        Ok(())
+    })?;
+    report(UpdatePhase::Verifying);
     let mut file = File::open(&dmg)?;
     let mut hash = Sha256::new();
     ensure!(io::copy(&mut file, &mut hash)? == asset.size

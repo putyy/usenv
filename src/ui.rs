@@ -29,7 +29,7 @@ use crate::php_extensions::{ExtensionInfo, ExtensionState, Operation as Extensio
 use crate::runtimes::{Mise, MiseTool};
 use crate::settings::{MAX_PARALLEL_INSTALLS, MIN_PARALLEL_INSTALLS, SettingsStore, ShellFile, Theme};
 use crate::setup;
-use crate::updates::{self, UpdateStatus};
+use crate::updates::{self, UpdatePhase, UpdateStatus};
 
 const INPUT_HEIGHT: Pixels = px(35.);
 const RECENT_PROJECTS: SharedString = SharedString::new_static("recent-projects");
@@ -1094,7 +1094,8 @@ impl Ui {
                     (format!("{} · {label}", task.title), color)
                 })
             });
-        let status = self.snapshot.update.progress().map(|text| (text.to_owned(), colors.accent)).or(status);
+        let phase = self.snapshot.update.phase();
+        let status = phase.map(|phase| (phase.label(), colors.accent)).or(status);
         let has_status = status.is_some();
         let has_output = !self.snapshot.output_tasks.is_empty();
         let status_area = div().id("open-output-status").flex_1().min_w_0().h_full()
@@ -1105,17 +1106,13 @@ impl Ui {
                     .child(div().min_w_0().truncate().text_size(px(12.))
                         .child(message.lines().next().unwrap_or_default().to_owned()))
             }));
-        let status_area = if has_output {
+        let status_area = if phase.is_some() {
+            keyboard_focus(status_area).cursor_pointer().child("›")
+                .on_click(cx.listener(|view, _, window, cx| view.open_update_dialog(window, cx)))
+        } else if has_output {
             keyboard_focus(status_area).cursor_pointer()
                 .hover(move |style| style.text_color(colors.ink))
-                .on_click(cx.listener(|view, _, _, cx| {
-                    let task_id = view.snapshot.output_tasks.iter().rev().find(|task| {
-                        matches!(task.status, TaskStatus::Running | TaskStatus::Queued)
-                    }).or_else(|| view.snapshot.output_tasks.back()).map(|task| task.id);
-                    view.log_open = true;
-                    view.select_install_log(task_id);
-                    cx.notify();
-                }))
+                .on_click(cx.listener(|view, _, _, cx| view.open_task_output(cx)))
         } else {
             status_area
         };
@@ -1128,9 +1125,22 @@ impl Ui {
             .px_7()
             .when(has_status, |bar| bar.bg(colors.surface))
             .child(status_area)
+            .when(phase.is_some() && has_output, |bar| bar.child(
+                button("open-task-output", "任务日志", ButtonStyle::Plain, true, colors)
+                    .on_click(cx.listener(|view, _, _, cx| view.open_task_output(cx))),
+            ))
             .children(self.snapshot.error.as_ref().map(|error| {
                 copy_button("copy-error", "复制详情", error.clone(), colors, cx)
             }))
+    }
+
+    fn open_task_output(&mut self, cx: &mut Context<Self>) {
+        let task_id = self.snapshot.output_tasks.iter().rev().find(|task| {
+            matches!(task.status, TaskStatus::Running | TaskStatus::Queued)
+        }).or_else(|| self.snapshot.output_tasks.back()).map(|task| task.id);
+        self.log_open = true;
+        self.select_install_log(task_id);
+        cx.notify();
     }
 
     fn task_output(&self, colors: Palette, cx: &Context<Self>) -> Option<Div> {
@@ -3453,7 +3463,7 @@ impl Ui {
     }
 
     fn open_update_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.update_dialog.is_some() || self.snapshot.update.offer().is_none() {
+        if self.update_dialog.is_some() || self.snapshot.update.release().is_none() {
             return;
         }
         self.open_actions = None;
@@ -3496,14 +3506,19 @@ impl Ui {
 
     fn render_update_dialog(&self, colors: Palette, cx: &Context<Self>) -> Option<Div> {
         let dialog = self.update_dialog.as_ref()?;
-        let release = self.snapshot.update.offer()?;
+        let release = self.snapshot.update.release()?;
         let page = release.page.clone();
-        let can_install = release.dmg.is_some();
+        let phase = self.snapshot.update.phase();
+        let can_install = phase.is_none() && release.dmg.is_some();
         let error = match &self.snapshot.update {
             UpdateStatus::InstallFailed(_, message) => Some(message.as_str()),
             _ => None,
         };
-        let title = if error.is_some() { "Usenv 更新失败" } else { "发现新版本" };
+        let title = match (phase, error) {
+            (Some(_), _) => "正在更新 Usenv",
+            (_, Some(_)) => "Usenv 更新失败",
+            _ => "发现新版本",
+        };
         let version_block = |label: &'static str, version: &str, background: Rgba, ink: Rgba| {
             div().flex_1().min_w_0().rounded_md().px_3().py_2().bg(background)
                 .flex().flex_col().gap_1()
@@ -3521,7 +3536,7 @@ impl Ui {
                 cx.open_url(&page);
             });
         let controls = div().flex().items_center().gap_2()
-            .child(button("update-dialog-cancel", "取消", ButtonStyle::Plain, true, colors)
+            .child(button("update-dialog-cancel", if phase.is_some() { "隐藏" } else { "取消" }, ButtonStyle::Plain, true, colors)
                 .track_focus(&dialog.cancel)
                 .focus(move |style| style.bg(colors.control_hover))
                 .on_click(cx.listener(|view, _, window, cx| view.dismiss_update_dialog(window, cx))))
@@ -3531,6 +3546,28 @@ impl Ui {
                     .track_focus(&dialog.install)
                     .on_click(cx.listener(|view, _, window, cx| view.install_dialog_update(window, cx))),
             ));
+        let body = div().px_5().pb_4().min_h_0().flex().flex_col().gap_2();
+        let body = if let Some(phase) = phase {
+            let body = body.child(div().font_weight(FontWeight::SEMIBOLD).child(phase.label()));
+            if let UpdatePhase::Downloading { received, total } = phase {
+                let fraction = received as f32 / total as f32;
+                body.child(div().w_full().h(px(6.)).rounded_full().bg(colors.control)
+                    .child(div().h_full().w(gpui::relative(fraction)).rounded_full().bg(colors.accent)))
+                    .child(div().text_size(px(12.)).text_color(colors.muted)
+                        .child(format!("{:.2} MB / {:.2} MB", received as f64 / 1e6, total as f64 / 1e6)))
+            } else {
+                body
+            }
+        } else {
+            body.child(div().font_weight(FontWeight::SEMIBOLD)
+                    .child(if error.is_some() { "失败原因" } else { "更新内容" }))
+                .child(div().id("update-dialog-notes").min_h_0().max_h(px(200.))
+                    .overflow_y_scroll().child(div().text_color(if error.is_some() { colors.danger } else { colors.ink })
+                        .child(error.unwrap_or(&release.notes).trim().to_owned())))
+                .child(div().pt_2().text_size(px(12.)).text_color(colors.muted)
+                    .child(if can_install { "下载完成后，Usenv 会自动安装并重新启动。" }
+                        else { "此版本暂未提供适用于本机且可校验的安装包。" }))
+        };
         let card = div().w(px(468.)).max_w_full().max_h_full().flex().flex_col()
             .rounded_xl().border_1().border_color(colors.control).bg(colors.background).shadow_lg()
             .child(div().flex_shrink_0().p_5().pb_4().flex().flex_col().gap_3()
@@ -3540,15 +3577,7 @@ impl Ui {
                     .child(version_block("当前版本", env!("CARGO_PKG_VERSION"), colors.surface, colors.ink))
                     .child(div().flex_shrink_0().text_color(colors.muted).child("→"))
                     .child(version_block("新版本", &release.version, colors.accent_soft, colors.accent))))
-            .child(div().px_5().pb_4().min_h_0().flex().flex_col().gap_2()
-                .child(div().font_weight(FontWeight::SEMIBOLD)
-                    .child(if error.is_some() { "失败原因" } else { "更新内容" }))
-                .child(div().id("update-dialog-notes").min_h_0().max_h(px(200.))
-                    .overflow_y_scroll().child(div().text_color(if error.is_some() { colors.danger } else { colors.ink })
-                        .child(error.unwrap_or(&release.notes).trim().to_owned()))))
-            .child(div().flex_shrink_0().px_5().pb_4().text_size(px(12.)).text_color(colors.muted)
-                .child(if can_install { "下载完成后，Usenv 会自动安装并重新启动。" }
-                    else { "此版本暂未提供适用于本机且可校验的安装包。" }))
+            .child(body)
             .child(div().flex_shrink_0().px_5().py_3().border_t_1().border_color(colors.control)
                 .flex().items_center().justify_between().child(github_link).child(controls));
         Some(div().absolute().inset_0().occlude().p_6().flex().items_center().justify_center()
@@ -3582,10 +3611,10 @@ impl Ui {
             UpdateStatus::Available(release) => Some(format!("可更新到 {}", release.version)),
             UpdateStatus::Failed(_) => Some("更新检查失败".into()),
             UpdateStatus::InstallFailed(_, _) => Some("更新失败".into()),
-            running => running.progress().map(str::to_owned),
+            UpdateStatus::InProgress(_, phase) => Some(phase.label()),
         };
         let message = status.map_or_else(|| format!("当前版本 {current}"), |status| format!("当前版本 {current} · {status}"));
-        let page = self.snapshot.update.offer().map(|release| release.page.clone())
+        let page = self.snapshot.update.release().map(|release| release.page.clone())
             .unwrap_or_else(|| updates::RELEASES.into());
         section("版本更新", colors.muted).child(
             panel(colors).p_4().flex().flex_col().gap_2()
@@ -3597,8 +3626,9 @@ impl Ui {
                     ))
                     .child(button("github-releases", "发布说明", ButtonStyle::Plain, true, colors)
                         .on_click(move |_, _, cx| cx.open_url(&page)))
-                    .children(self.snapshot.update.offer().map(|_| {
-                        button("show-update", "查看更新", ButtonStyle::Primary, true, colors)
+                    .children(self.snapshot.update.release().map(|_| {
+                        let label = if self.snapshot.update.phase().is_some() { "查看进度" } else { "查看更新" };
+                        button("show-update", label, ButtonStyle::Primary, true, colors)
                             .on_click(cx.listener(|view, _, window, cx| view.open_update_dialog(window, cx)))
                     })))
                 .children(match &self.snapshot.update {
